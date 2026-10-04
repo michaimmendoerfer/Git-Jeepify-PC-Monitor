@@ -1,4 +1,5 @@
 
+
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
@@ -31,7 +32,7 @@ String macToString(const uint8_t *mac) {
     return String(macStr);
 }
 
-// Statische HTML/JS-Oberfläche mit komplett zweizeiligem Layout (Links & Rechts)
+// Statische HTML/JS-Oberfläche mit zweizeiligem Layout und dynamischen Dropdown-Filtern
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="de">
@@ -51,6 +52,12 @@ const char index_html[] PROGMEM = R"rawliteral(
         .btn-pause { background: #007bff; color: white; border: none; padding: 10px 15px; border-radius: 4px; cursor: pointer; font-weight: bold; width: 100%; margin-bottom: 15px; }
         .btn-pause.paused { background: #dc3545; }
         
+        /* Filter-Bereich */
+        .filter-container { display: flex; gap: 10px; margin-bottom: 15px; background: #f1f5f9; padding: 10px; border-radius: 6px; border: 1px solid #cbd5e1; }
+        .filter-group { flex: 1; display: flex; flex-direction: column; gap: 4px; }
+        .filter-group label { font-size: 0.8em; font-weight: bold; color: #475569; }
+        .filter-group select { padding: 6px; border-radius: 4px; border: 1px solid #94a3b8; font-size: 0.9em; background: white; }
+
         /* Globales zweizeiliges Layout-System */
         .display-container { display: flex; flex-direction: column; gap: 12px; margin-top: 10px; }
         .row-primary { display: flex; gap: 15px; background: #eef7ff; padding: 10px 12px; border-radius: 6px; border-left: 5px solid #007bff; }
@@ -59,10 +66,9 @@ const char index_html[] PROGMEM = R"rawliteral(
         .row-primary .value { font-size: 1.25em; font-weight: bold; color: #004085; font-family: monospace; }
         
         .row-secondary { background: #f8f9fa; padding: 10px 12px; border-radius: 6px; border: 1px solid #e2e8f0; font-size: 0.9em; }
-        .row-secondary .label { font-weight: bold; color: #495057; }
         .secondary-badge { display: inline-block; background: #e2e8f0; padding: 2px 6px; border-radius: 4px; margin: 2px 4px 2px 0; font-family: monospace; font-size: 0.85em; }
 
-        /* Historie-spezifische Anpassungen */
+        /* Historie-Spezifikationen */
         .history-list { max-height: 600px; overflow-y: auto; border: 1px solid #ddd; border-radius: 4px; display: flex; flex-direction: column; gap: 10px; padding: 10px; background: #fafafa; }
         .history-item { background: white; padding: 10px; border-radius: 6px; border: 1px solid #e2e8f0; cursor: pointer; transition: all 0.2s; box-shadow: 0 2px 4px rgba(0,0,0,0.02); }
         .history-item:hover { background: #f1f5f9; border-color: #cbd5e1; }
@@ -92,10 +98,25 @@ const char index_html[] PROGMEM = R"rawliteral(
         <pre id="raw-json">{}</pre>
     </div>
 
-    <!-- Rechte Spalte: Verlauf -->
+    <!-- Rechte Spalte: Verlauf mit Filtern -->
     <div class="card">
         <h1>Letzte 100 Nachrichten</h1>
-        <p class="meta">Klicke auf eine Nachricht, um sie links im Detail einzufrieren.</p>
+        
+        <div class="filter-container">
+            <div class="filter-group">
+                <label for="filter-snd">Filter nach SND:</label>
+                <select id="filter-snd" onchange="applyFilters()">
+                    <option value="all">-- Alle (SND) --</option>
+                </select>
+            </div>
+            <div class="filter-group">
+                <label for="filter-o">Filter nach O:</label>
+                <select id="filter-o" onchange="applyFilters()">
+                    <option value="all">-- Alle (O:) --</option>
+                </select>
+            </div>
+        </div>
+
         <div id="history-container" class="history-list"></div>
     </div>
 
@@ -105,6 +126,9 @@ const char index_html[] PROGMEM = R"rawliteral(
         let isPaused = false;
         let localHistory = [];
         let selectedIndex = null;
+        
+        let knownSndValues = new Set();
+        let knownOValues = new Set();
 
         function initWebSocket() {
             websocket = new WebSocket(gateway);
@@ -120,7 +144,6 @@ const char index_html[] PROGMEM = R"rawliteral(
             websocket.onmessage = onMessage;
         }
 
-        // Steuert den Pausenzustand der UI
         function setPauseState(state) {
             isPaused = state;
             const btn = document.getElementById('pause-btn');
@@ -151,6 +174,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             
             if (Array.isArray(data)) {
                 localHistory = data.map(str => JSON.parse(str)).reverse();
+                updateFilterOptionsFromHistory();
                 renderHistory();
                 if(localHistory.length > 0 && !isPaused) {
                     updateLiveView(localHistory[0]);
@@ -162,6 +186,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             if (localHistory.length > 100) localHistory.pop();
             if (selectedIndex !== null) selectedIndex++;
             
+            updateFilterOptions(data);
             renderHistory();
 
             if (!isPaused) {
@@ -169,7 +194,50 @@ const char index_html[] PROGMEM = R"rawliteral(
             }
         }
 
-        // Erzeugt die zweizeilige Darstellung für Links und Rechts
+        function updateFilterOptions(item) {
+            let updated = false;
+            if (item.parsed.hasOwnProperty('SND')) {
+                let sVal = String(item.parsed['SND']);
+                if (!knownSndValues.has(sVal)) { knownSndValues.add(sVal); updated = true; }
+            }
+            if (item.parsed.hasOwnProperty('O')) {
+                let oVal = String(item.parsed['O']);
+                if (!knownOValues.has(oVal)) { knownOValues.add(oVal); updated = true; }
+            }
+            if (updated) populateDropdowns();
+        }
+
+        function updateFilterOptionsFromHistory() {
+            knownSndValues.clear();
+            knownOValues.clear();
+            localHistory.forEach(item => {
+                if (item.parsed.hasOwnProperty('SND')) knownSndValues.add(String(item.parsed['SND']));
+                if (item.parsed.hasOwnProperty('O')) knownOValues.add(String(item.parsed['O']));
+            });
+            populateDropdowns();
+        }
+
+        function populateDropdowns() {
+            const sndSelect = document.getElementById('filter-snd');
+            const oSelect = document.getElementById('filter-o');
+            
+            const currentSnd = sndSelect.value;
+            const currentO = oSelect.value;
+            
+            sndSelect.innerHTML = '<option value="all">-- Alle (SND) --</option>';
+            Array.from(knownSndValues).sort().forEach(val => {
+                sndSelect.innerHTML += `<option value="${val}">${val}</option>`;
+            });
+            
+            oSelect.innerHTML = '<option value="all">-- Alle (O:) --</option>';
+            Array.from(knownOValues).sort().forEach(val => {
+                oSelect.innerHTML += `<option value="${val}">${val}</option>`;
+            });
+            
+            sndSelect.value = currentSnd;
+            oSelect.value = currentO;
+        }
+
         function buildTwoRowHtml(data) {
             let sndVal = data.parsed.hasOwnProperty('SND') ? data.parsed['SND'] : '--';
             let rcvVal = data.parsed.hasOwnProperty('RCV') ? data.parsed['RCV'] : '--';
@@ -181,13 +249,13 @@ const char index_html[] PROGMEM = R"rawliteral(
             for (const [key, value] of Object.entries(data.parsed)) {
                 if (!coreKeys.includes(key)) {
                     hasSecondary = true;
-                    secondaryHtml += `<span class="secondary-badge"><span class="label">${key}:</span> ${value}</span>`;
+                    secondaryHtml += `<span class="secondary-badge"><b>${key}:</b> ${value}</span>`;
                 }
             }
 
             if(data.parsed.hasOwnProperty('Fehler')) {
                 hasSecondary = true;
-                secondaryHtml += `<span class="secondary-badge" style="background:#f8d7da; color:#721c24;"><span class="label">Fehler:</span> ${data.parsed['Fehler']}</span>`;
+                secondaryHtml += `<span class="secondary-badge" style="background:#f8d7da; color:#721c24;"><b>Fehler:</b> ${data.parsed['Fehler']}</span>`;
             }
 
             if (!hasSecondary) {
@@ -218,9 +286,23 @@ const char index_html[] PROGMEM = R"rawliteral(
             document.getElementById('parsed-data-container').innerHTML = buildTwoRowHtml(data);
         }
 
+        function applyFilters() {
+            renderHistory();
+        }
+
         function renderHistory() {
+            const filterSnd = document.getElementById('filter-snd').value;
+            const filterO = document.getElementById('filter-o').value;
+            
             let html = "";
+
             localHistory.forEach((item, index) => {
+                let itemSnd = item.parsed.hasOwnProperty('SND') ? String(item.parsed['SND']) : 'all';
+                let itemO = item.parsed.hasOwnProperty('O') ? String(item.parsed['O']) : 'all';
+                
+                if (filterSnd !== 'all' && itemSnd !== filterSnd) return;
+                if (filterO !== 'all' && itemO !== filterO) return;
+                
                 let isSelected = (index === selectedIndex) ? "selected" : "";
                 let cardBody = buildTwoRowHtml(item);
                 
@@ -231,7 +313,8 @@ const char index_html[] PROGMEM = R"rawliteral(
                     ${cardBody}
                 </div>`;
             });
-            document.getElementById('history-container').innerHTML = html || "<p style='padding:10px; color:#999;'>Noch kein Verlauf vorhanden.</p>";
+            
+            document.getElementById('history-container').innerHTML = html || "<p style='padding:10px; color:#999;'>Keine Nachrichten entsprechen dem Filter.</p>";
         }
 
         function selectHistoryItem(index) {
